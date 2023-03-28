@@ -31,6 +31,7 @@ import { execPromise, getPodmanCli, getPodmanInstallation } from './podman-cli';
 import { PodmanConfiguration } from './podman-configuration';
 import { getDetectionChecks } from './detection-checks';
 import { getDisguisedPodmanInformation, getSocketPath, isDisguisedPodman } from './warnings';
+import { getSocketCompatibility } from './compatibility-mode';
 
 type StatusHandler = (name: string, event: extensionApi.ProviderConnectionStatus) => void;
 
@@ -46,6 +47,7 @@ const podmanMachinesStatuses = new Map<string, extensionApi.ProviderConnectionSt
 let podmanProviderStatus: extensionApi.ProviderConnectionStatus = 'started';
 const podmanMachinesInfo = new Map<string, MachineInfo>();
 const currentConnections = new Map<string, extensionApi.Disposable>();
+const containerProviderConnections = new Map<string, extensionApi.ContainerProviderConnection>();
 
 // Warning to check to see if the socket is a disguised Podman socket,
 // by default we assume it is until proven otherwise when we check
@@ -93,13 +95,18 @@ async function updateMachines(provider: extensionApi.Provider): Promise<void> {
     }
     podmanMachinesInfo.set(machine.Name, {
       name: machine.Name,
-      memory: parseInt(machine.Memory) / 1048576,
+      memory: parseInt(machine.Memory),
       cpus: machine.CPUs,
-      diskSize: parseInt(machine.DiskSize) / 1073741824,
+      diskSize: parseInt(machine.DiskSize),
     });
 
     if (!podmanMachinesStatuses.has(machine.Name)) {
       podmanMachinesStatuses.set(machine.Name, status);
+    }
+
+    if (containerProviderConnections.has(machine.Name)) {
+      const containerProviderConnection = containerProviderConnections.get(machine.Name);
+      updateContainerConfiguration(containerProviderConnection, podmanMachinesInfo.get(machine.Name));
     }
   });
 
@@ -110,6 +117,7 @@ async function updateMachines(provider: extensionApi.Provider): Promise<void> {
   machinesToRemove.forEach(machine => {
     podmanMachinesStatuses.delete(machine);
     podmanMachinesInfo.delete(machine);
+    containerProviderConnections.delete(machine);
   });
 
   // create connections for new machines
@@ -178,6 +186,19 @@ async function updateMachines(provider: extensionApi.Provider): Promise<void> {
       provider.updateStatus('configured');
     }
   }
+}
+
+function updateContainerConfiguration(
+  containerProviderConnection: extensionApi.ContainerProviderConnection,
+  machineInfo: MachineInfo,
+) {
+  // get configuration for this connection
+  const containerConfiguration = extensionApi.configuration.getConfiguration('podman', containerProviderConnection);
+
+  // Set values for the machine
+  containerConfiguration.update('machine.cpus', machineInfo.cpus);
+  containerConfiguration.update('machine.memory', machineInfo.memory);
+  containerConfiguration.update('machine.diskSize', machineInfo.diskSize);
 }
 
 function calcMacosSocketPath(machineName: string): string {
@@ -338,6 +359,7 @@ function prettyMachineName(machineName: string): string {
   }
   return name;
 }
+
 async function registerProviderFor(provider: extensionApi.Provider, machineInfo: MachineInfo, socketPath: string) {
   const lifecycle: extensionApi.ProviderConnectionLifecycle = {
     start: async (context): Promise<void> => {
@@ -371,6 +393,7 @@ async function registerProviderFor(provider: extensionApi.Provider, machineInfo:
   };
 
   monitorPodmanSocket(socketPath, machineInfo.name);
+  containerProviderConnections.set(machineInfo.name, containerProviderConnection);
 
   const disposable = provider.registerContainerProviderConnection(containerProviderConnection);
   provider.updateStatus('ready');
@@ -442,6 +465,10 @@ export async function activate(extensionContext: extensionApi.ExtensionContext):
       url: 'https://podman.io/getting-started/installation',
     },
     {
+      title: 'Read the Podman/Docker compatibility guide',
+      url: 'https://podman-desktop.io/docs/troubleshooting#warning-about-docker-compatibility-mode',
+    },
+    {
       title: 'Join the Podman community',
       url: 'https://podman.io/community/',
     },
@@ -451,9 +478,63 @@ export async function activate(extensionContext: extensionApi.ExtensionContext):
 
   // Check on initial setup
   checkDisguisedPodmanSocket(provider);
-  // update the status of the provider if the socket is changed, created or deleted
+
+  // Update the status of the provider if the socket is changed, created or deleted
   disguisedPodmanSocketWatcher = setupDisguisedPodmanSocketWatcher(provider, getSocketPath());
   extensionContext.subscriptions.push(disguisedPodmanSocketWatcher);
+
+  // Compatibility mode status bar item
+  // only available for macOS (for now).
+  if (isMac()) {
+    // Get the socketCompatibilityClass for the current OS.
+    const socketCompatibilityMode = getSocketCompatibility();
+
+    // Create a status bar item to show the status of compatibility mode as well as
+    // create a command so when you can disable / enable compatibility mode
+    const statusBarItem = extensionApi.window.createStatusBarItem();
+    statusBarItem.text = 'Docker Compatibility';
+    statusBarItem.command = 'podman.socketCompatibilityMode';
+
+    // Use tooltip text from class
+    statusBarItem.tooltip = socketCompatibilityMode.tooltipText();
+
+    statusBarItem.iconClass = 'fa fa-plug';
+    statusBarItem.show();
+    extensionContext.subscriptions.push(statusBarItem);
+
+    // Create a modal dialog to ask the user if they want to enable or disable compatibility mode
+    const command = extensionApi.commands.registerCommand('podman.socketCompatibilityMode', async () => {
+      // Manually check to see if the socket is disguised (this will be called when pressing the status bar item)
+      const isDisguisedPodmanSocket = await isDisguisedPodman();
+
+      if (!isDisguisedPodmanSocket && !socketCompatibilityMode.isEnabled()) {
+        const result = await extensionApi.window.showInformationMessage(
+          `Do you want to automatically enable Docker socket compatibility mode for Podman?\n\n${socketCompatibilityMode.details}`,
+          'Enable',
+          'Cancel',
+        );
+
+        if (result === 'Enable') {
+          await socketCompatibilityMode.enable();
+        }
+      } else {
+        const result = await extensionApi.window.showInformationMessage(
+          `Do you want to automatically disable Docker socket compatibility mode for Podman?\n\n${socketCompatibilityMode.details}`,
+          'Disable',
+          'Cancel',
+        );
+
+        if (result === 'Disable') {
+          await socketCompatibilityMode.disable();
+        }
+      }
+      // Use tooltip text from class
+      statusBarItem.tooltip = socketCompatibilityMode.tooltipText();
+    });
+
+    // Push the results of the command so we can unload it later
+    extensionContext.subscriptions.push(command);
+  }
 
   // provide an installation path ?
   if (podmanInstall.isAbleToInstall()) {
@@ -500,8 +581,12 @@ export async function activate(extensionContext: extensionApi.ExtensionContext):
 
   // allows to create machines
   if (isMac() || isWindows()) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const createFunction = async (params: { [key: string]: any }, logger: extensionApi.Logger): Promise<void> => {
+    const createFunction = async (
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      params: { [key: string]: any },
+      logger: extensionApi.Logger,
+      token?: extensionApi.CancellationToken,
+    ): Promise<void> => {
       const parameters = [];
       parameters.push('machine');
       parameters.push('init');
@@ -574,7 +659,7 @@ export async function activate(extensionContext: extensionApi.ExtensionContext):
           }
         }
       }
-      await execPromise(getPodmanCli(), parameters, { logger, env });
+      await execPromise(getPodmanCli(), parameters, { logger, env }, token);
     };
 
     provider.setContainerProviderConnectionFactory({
